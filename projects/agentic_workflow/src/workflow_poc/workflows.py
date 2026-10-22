@@ -4,6 +4,7 @@ from datetime import timedelta
 from typing import Any
 from .models import AIReviewResult, ReviewDisposition
 from .policies import evaluate_review
+from temporalio.common import RetryPolicy
 
 @workflow.defn
 class HelloWorkflow:
@@ -45,6 +46,12 @@ class ProtocolValidationWorkflow:
             "validate_protocol",
             args=[protocol_data],
             start_to_close_timeout=timedelta(seconds=10),
+            retry_policy=RetryPolicy(
+                initial_interval=timedelta(seconds=1),
+                maximum_interval=timedelta(seconds=10),
+                backoff_coefficient=2.0,
+                maximum_attempts=3,
+            ),
         )
 
         if not validation["valid"]:
@@ -59,6 +66,12 @@ class ProtocolValidationWorkflow:
             "review_protocol",
             args=[protocol_data],
             start_to_close_timeout=timedelta(seconds=30),
+            retry_policy=RetryPolicy(
+                initial_interval=timedelta(seconds=1),
+                maximum_interval=timedelta(seconds=10),
+                backoff_coefficient=2.0,
+                maximum_attempts=3,
+            ),
         )
 
         review = AIReviewResult.model_validate(raw_review)

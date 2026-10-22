@@ -1,10 +1,21 @@
 
 from typing import Any
-
+import os
 from pydantic import ValidationError
 from temporalio import activity
+from openai import AsyncOpenAI
+from .models import ProtocolInput, AIReviewResult
+import json
 
-from .models import ProtocolInput
+def get_llm_client() -> AsyncOpenAI:
+    return AsyncOpenAI(
+        base_url=os.getenv(
+            "LLM_BASE_URL",
+            "http://localhost:8080/v1",
+        ),
+        api_key=os.getenv("LLM_API_KEY", "not-needed"),
+        timeout=60.0,
+    )
 
 
 @activity.defn
@@ -46,22 +57,66 @@ async def validate_protocol(
 async def review_protocol(
     protocol_data: dict[str, Any],
 ) -> dict[str, Any]:
-    """Simulate an AI review with a predictable result."""
+    """Review a protocol using a local LLM."""
 
-    return {
-        "findings": [
+    client = get_llm_client()
+
+    prompt = f"""
+You are assisting with a synthetic clinical research protocol review.
+
+Identify potential issues in the protocol's methodology, population,
+inclusion and exclusion criteria, and endpoints.
+
+Return a JSON object with exactly these top-level fields:
+- findings: a list of findings
+- confidence: a number between 0 and 1
+
+Each finding must contain:
+- code: short issue identifier
+- description: explanation of the potential issue
+- severity: one of "low", "medium", "high"
+- evidence: specific evidence from the supplied protocol
+
+If the protocol does not provide evidence for a concern, do not
+invent it. Distinguish missing information from confirmed errors.
+This is a preliminary review, not a clinical determination.
+
+Protocol:
+{json.dumps(protocol_data, ensure_ascii=False)}
+"""
+    print("[LLM CHECK] Sending request...", flush=True)
+    response = await client.chat.completions.create(
+        model=os.getenv(
+            "LLM_MODEL",
+            "Qwen3-8B-Q4_K_M.gguf",
+        ),
+        messages=[
             {
-                "code": "METHOD-001",
-                "description": (
-                    "The protocol should clarify how missing outcome "
-                    "measurements will be handled."
+                "role": "system",
+                "content": (
+                    "Return only valid JSON matching the requested "
+                    "structure. Do not include Markdown fences."
                 ),
-                "severity": "medium",
-                "evidence": (
-                    "The submitted protocol does not specify a "
-                    "missing-outcome handling procedure."
-                ),
-            }
+            },
+            {"role": "user", "content": prompt},
         ],
-        "confidence": 0.65,
-    }
+        temperature=0.0,
+        response_format={"type": "json_object"},
+    )
+    
+    print("[LLM CHECK] Response received.", flush=True)
+    content = response.choices[0].message.content
+
+    if not content:
+        raise RuntimeError("The LLM returned an empty response.")
+
+    try:
+        result = AIReviewResult.model_validate_json(content)
+    except ValidationError as exc:
+        # Raise an Activity failure so Temporal's configured retry
+        # policy can handle a transient malformed response.
+        raise RuntimeError(
+            f"The LLM returned an invalid review structure: {exc}"
+        ) from exc
+
+    return result.model_dump(mode="json")
